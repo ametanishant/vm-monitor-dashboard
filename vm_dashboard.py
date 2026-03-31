@@ -3,16 +3,64 @@ import paramiko
 import pandas as pd
 import time
 import socket
+import threading
+import urllib.parse
+import importlib.util
+
+# start terminal server in background thread (uses websockets + paramiko)
+try:
+    # only start once per Streamlit session
+    if 'term_server_started' not in st.session_state:
+        spec = importlib.util.find_spec('terminal_server')
+        if spec is not None:
+            from terminal_server import run_server
+
+            def _start_ts():
+                try:
+                    run_server('localhost', 8765)
+                except Exception:
+                    pass
+
+            t = threading.Thread(target=_start_ts, daemon=True)
+            t.start()
+            st.session_state.term_server_started = True
+except Exception:
+    pass
 
 # ---------- CONFIG ----------
 st.set_page_config(page_title="VM Dashboard", layout="wide")
 
 # ---------- SSH ----------
-@st.cache_resource
-def connect_ssh(host, username, password):
+def connect_ssh(host, username, password, timeout=5):
+    """Return an active Paramiko SSHClient for the given host.
+
+    Clients are cached in `st.session_state['ssh_clients']` keyed by
+    host+username. If a cached client is present but its transport is not
+    active, a new connection will be established and replace the cached
+    client. This avoids returning a stale/disconnected client from
+    Streamlit's cache and allows automatic reconnect attempts.
+    """
+    if 'ssh_clients' not in st.session_state:
+        st.session_state.ssh_clients = {}
+
+    key = f"{host}|{username}"
+    client = st.session_state.ssh_clients.get(key)
+
+    if client:
+        try:
+            trans = client.get_transport()
+            if trans is not None and trans.is_active():
+                return client
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    ssh.connect(host, username=username, password=password)
+    ssh.connect(host, username=username, password=password, timeout=timeout)
+    st.session_state.ssh_clients[key] = ssh
     return ssh
 
 def run_command(ssh, command):
@@ -226,6 +274,101 @@ def probe_ssh_port(ip, port=22, timeout=2):
         return False
 
 
+def run_ocnos_command(ssh, vpc_name, command, timeout=8):
+    """Open a PTY, attach to the domain console, send `command`, capture output,
+    then send the console escape (ASCII 29) to exit.
+
+    This replicates the manual steps: `virsh console --force <dom>` -> interact -> ^]
+    If the console shows a login prompt and sidebar guest credentials are set
+    (`guest_user`/`guest_pwd`), they will be used to authenticate automatically.
+    """
+    try:
+        chan = ssh.get_transport().open_session()
+        chan.get_pty()
+        # Start the interactive console
+        chan.exec_command(f"virsh console --force '{vpc_name}'")
+
+        start = time.time()
+        out = ""
+        connected = False
+
+        # wait for console to attach (look for Connected/Escape or a login/prompt)
+        while True:
+            if chan.recv_ready():
+                chunk = chan.recv(4096).decode(errors='ignore')
+                out += chunk
+                lower = chunk.lower()
+                if 'connected to domain' in lower or 'escape character is' in lower:
+                    connected = True
+                    break
+                # if we see a prompt immediately, treat as connected
+                if '\n' in chunk and (chunk.strip().endswith('>') or chunk.strip().endswith('#')):
+                    connected = True
+                    break
+            if time.time() - start > timeout:
+                break
+            time.sleep(0.05)
+
+        if not connected:
+            # return whatever we got — likely the TTY error
+            try:
+                # drain stderr if any
+                if chan.recv_stderr_ready():
+                    out += chan.recv_stderr(4096).decode(errors='ignore')
+            except Exception:
+                pass
+            chan.close()
+            return out
+
+        # If console requires login, handle basic login prompt using guest creds
+        # Look for 'login:' or 'Password:' in the existing output
+        try:
+            if 'login:' in out.lower() and 'guest_user' in globals() and guest_user:
+                chan.send(guest_user + '\n')
+                time.sleep(0.2)
+                out += chan.recv(4096).decode(errors='ignore') if chan.recv_ready() else ''
+            if 'password:' in out.lower() and 'guest_pwd' in globals() and guest_pwd:
+                chan.send(guest_pwd + '\n')
+                time.sleep(0.2)
+                out += chan.recv(4096).decode(errors='ignore') if chan.recv_ready() else ''
+        except Exception:
+            pass
+
+        # Send the actual command and give the guest some time to respond
+        chan.send(command + '\n')
+        cmd_start = time.time()
+        while True:
+            if chan.recv_ready():
+                out += chan.recv(4096).decode(errors='ignore')
+            if time.time() - cmd_start > timeout:
+                break
+            time.sleep(0.05)
+
+        # Send escape (ASCII 29) to exit the console
+        try:
+            chan.send(chr(29))
+        except Exception:
+            pass
+
+        # Read any final output
+        final_start = time.time()
+        while True:
+            if chan.recv_ready():
+                out += chan.recv(4096).decode(errors='ignore')
+            if chan.exit_status_ready() or time.time() - final_start > 1.0:
+                break
+            time.sleep(0.05)
+
+        try:
+            chan.close()
+        except Exception:
+            pass
+
+        return out
+    except Exception as e:
+        return f"ERROR: {e}"
+
+
 def check_guest_session(guest_ip, guest_user, guest_pwd):
     """If guest credentials provided, SSH into guest and run `who` to detect logged-in users."""
     try:
@@ -263,15 +406,31 @@ guest_pwd = st.sidebar.text_input("Guest Password (optional)", type="password")
 if st.sidebar.button("➕ Add VM"):
     if host and user and pwd:
         st.session_state.vms.append({"host": host, "user": user, "pwd": pwd})
+        st.session_state.last_active = time.time()
 
-refresh_rate = st.sidebar.slider("Refresh Interval (sec)", 2, 10, 3)
+refresh_minutes = st.sidebar.slider("Refresh Interval (minutes)", 1, 60, 3)
+# convert minutes to seconds for internal use
+refresh_rate = refresh_minutes * 60
 cpu_alert_threshold = st.sidebar.slider("CPU Alert %", 50, 100, 80)
 
 # ---------- STORAGE ----------
 if "history" not in st.session_state:
     st.session_state.history = {}
 
+# Session inactivity timeout (seconds)
+TIMEOUT_SECONDS = 5 * 60
+if "last_active" not in st.session_state:
+    st.session_state.last_active = time.time()
+
 # ---------- MAIN ----------
+# Auto-logout if idle
+if time.time() - st.session_state.last_active > TIMEOUT_SECONDS:
+    st.session_state.vms = []
+    st.session_state.history = {}
+    st.session_state.vpc_prev = {}
+    st.warning("Logged out due to 5 minutes of inactivity.")
+    st.stop()
+
 for vm in st.session_state.vms:
     host = vm["host"]
 
@@ -360,6 +519,70 @@ for vm in st.session_state.vms:
 
             df_vpc = pd.DataFrame(rows)
             st.dataframe(df_vpc, use_container_width=True)
+
+            st.markdown("### VPC Console")
+            for v in rows:
+                name = v.get('name')
+                safe_name = name.replace(' ', '_') if name else 'unknown'
+                with st.expander(f"{name} ({v.get('state')})"):
+                    st.write({k: v.get(k) for k in ['id','state','guest_ip','ssh_open','cpu_%']})
+                    cmd_key = f"ocnos_cmd_{host}_{safe_name}"
+                    run_key = f"ocnos_run_{host}_{safe_name}"
+                    out_key = f"ocnos_out_{host}_{safe_name}"
+                    cmd = st.text_input("OCNOS command", key=cmd_key)
+                    # open interactive terminal using xterm.js
+                    if st.button("Open Terminal", key=f"open_term_{host}_{safe_name}"):
+                        # build websocket URL with encoded params
+                        params = {
+                            'host': host,
+                            'user': vm.get('user'),
+                            'pwd': vm.get('pwd'),
+                            'dom': name,
+                        }
+                        qs = urllib.parse.urlencode(params)
+                        ws_url = f"ws://localhost:8765/?{qs}"
+                        html = f"""
+<link rel="stylesheet" href="https://unpkg.com/xterm/css/xterm.css" />
+<div id="terminal" style="width:100%; height:420px; background:#000;"></div>
+<script src="https://unpkg.com/xterm/lib/xterm.js"></script>
+<script>
+  const term = new Terminal();
+  term.open(document.getElementById('terminal'));
+  const ws = new WebSocket('{ws_url}');
+  ws.onopen = function() {{ term.write('\r\n--- Connected ---\r\n'); }};
+  ws.onmessage = function(evt) {{ term.write(evt.data); }};
+  ws.onclose = function() {{ term.write('\r\n--- Disconnected ---\r\n'); }};
+  term.onData(function(data) {{ ws.send(data); }});
+</script>
+"""
+                        st.components.v1.html(html, height=460, scrolling=True)
+                    if st.button("Run on console", key=run_key):
+                        st.session_state.last_active = time.time()
+                        if cmd:
+                            try:
+                                out = run_ocnos_command(ssh, name, cmd)
+                                # Detect virsh console TTY error and offer fallback via guest SSH
+                                if isinstance(out, str) and "cannot run interactive console without a controlling tty" in out.lower():
+                                    guest_ip = v.get('guest_ip')
+                                    if guest_ip and guest_user and guest_pwd:
+                                        try:
+                                            ssh_guest = paramiko.SSHClient()
+                                            ssh_guest.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                                            ssh_guest.connect(guest_ip, username=guest_user, password=guest_pwd, timeout=5)
+                                            stdin_g, stdout_g, stderr_g = ssh_guest.exec_command(cmd)
+                                            guest_out = stdout_g.read().decode(errors='ignore') + stderr_g.read().decode(errors='ignore')
+                                            ssh_guest.close()
+                                            st.text_area("Output (guest SSH fallback)", guest_out, height=300, key=out_key)
+                                        except Exception as ge:
+                                            st.error(f"Console TTY error and guest SSH fallback failed: {ge}")
+                                    else:
+                                        st.error("error: Cannot run interactive console without a controlling TTY. Provide guest SSH credentials as fallback.")
+                                else:
+                                    st.text_area("Output", out, height=300, key=out_key)
+                            except Exception as e:
+                                st.error(f"Failed to run command on {name}: {e}")
+                        else:
+                            st.info("Enter a command first.")
         else:
             st.info("No VPCs found")
 
